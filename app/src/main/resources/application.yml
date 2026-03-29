@@ -1,5 +1,5 @@
-# AI Interview Platform Configuration
 # 智能AI面试官平台配置
+# AI Interview Platform Configuration
 
 server:
   port: 8080
@@ -18,7 +18,7 @@ spring:
   datasource:
     url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5432}/${POSTGRES_DB:interview_guide}
     username: ${POSTGRES_USER:postgres}
-    password: ${POSTGRES_PASSWORD:123456}
+    password: ${POSTGRES_PASSWORD:VasyaManbo}
     driver-class-name: org.postgresql.Driver
 
   jpa:
@@ -107,8 +107,8 @@ app:
   # RustFS (S3兼容) 存储配置
   storage:
     endpoint: ${APP_STORAGE_ENDPOINT:http://localhost:9000}
-    access-key: ${APP_STORAGE_ACCESS_KEY:wr45VXJZhCxc6FAWz0YR}
-    secret-key: ${APP_STORAGE_SECRET_KEY:GtKxV57WJkpw4CvASPBzTy2DYElLnRqh8dIXQa0m}
+    access-key: ${APP_STORAGE_ACCESS_KEY:kn6vaRU9Np2O0bDPLoMu}
+    secret-key: ${APP_STORAGE_SECRET_KEY:MRfPQ453iu2ZHxdFenXAoT6ztqr1wgGpbJ8lN0sj }
     bucket: ${APP_STORAGE_BUCKET:interview-guide}
     region: ${APP_STORAGE_REGION:us-east-1}
   
