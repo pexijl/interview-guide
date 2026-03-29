@@ -23,7 +23,7 @@ spring:
 
   jpa:
     hibernate:
-      ddl-auto: create #首次启动用 create，表创建成功后，改回 update
+      ddl-auto: update #首次启动用 create，表创建成功后，改回 update
     show-sql: false
     properties:
       hibernate:
@@ -43,6 +43,7 @@ spring:
       config: |
         singleServerConfig:
           address: "redis://${REDIS_HOST:localhost}:${REDIS_PORT:6379}"
+          password: "VasyaManbo" 
           database: 0
           connectionMinimumIdleSize: 10
           connectionPoolSize: 64
@@ -50,18 +51,21 @@ spring:
           subscriptionConnectionPoolSize: 50
   
   # Spring AI - 阿里云DashScope (OpenAI兼容模式)
+
   ai:
     openai:
       base-url: https://dashscope.aliyuncs.com/compatible-mode
       api-key: ${AI_BAILIAN_API_KEY}
       chat:
         options:
-          model: ${AI_MODEL:qwen-plus}
+          model: ${AI_MODEL:qwen3.5-plus}
           temperature: 0.2
       # Embedding模型配置 - 使用text-embedding-v3
       embedding:
         options:
-          model: text-embedding-v3
+          model: text-embedding-v4
+
+
     # 禁用自动重试机制，让异常立即返回
     retry:
       max-attempts: 1  # 不重试，失败立即返回
@@ -71,7 +75,7 @@ spring:
       pgvector:
         index-type: HNSW
         distance-type: COSINE_DISTANCE
-        dimensions: 1024  # text-embedding-v3实际生成的向量维度
+        dimensions: 1024  # text-embedding-v4实际生成的向量维度
         initialize-schema: true # 开发环境设置为 true，方便快速启动。生产环境设置为 false，手动管理数据库 schema，避免意外变更。
         remove-existing-vector-store-table: false  # 保留现有表和数据
 

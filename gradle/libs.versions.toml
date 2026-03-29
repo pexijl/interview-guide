@@ -2,7 +2,7 @@
 
 [versions]
 spring-boot = "4.0.1"
-spring-ai = "2.0.0-M1"
+spring-ai = "2.0.0-M3"
 tika = "3.3.0"
 lombok = "1.18.36"
 junit-jupiter = "5.12.0"
