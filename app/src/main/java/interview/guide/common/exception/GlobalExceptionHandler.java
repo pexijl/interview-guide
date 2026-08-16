@@ -89,20 +89,18 @@ public class GlobalExceptionHandler {
     @ResponseStatus(HttpStatus.OK)
     public Result<Void> handleResourceAccessException(ResourceAccessException e) {
         log.error("AI服务连接失败: {}", e.getMessage(), e);
-        
-        // 判断具体异常类型
-        Throwable cause = e.getCause();
-        if (cause instanceof SocketTimeoutException) {
-            return Result.error(ErrorCode.AI_SERVICE_TIMEOUT, "AI服务响应超时，请稍后重试");
-        }
-        
-        // SSL握手失败或其他网络问题
-        String message = e.getMessage();
-        if (message != null && message.contains("handshake")) {
-            return Result.error(ErrorCode.AI_SERVICE_UNAVAILABLE, "AI服务连接失败（网络不稳定），请检查网络或稍后重试");
-        }
-        
-        return Result.error(ErrorCode.AI_SERVICE_UNAVAILABLE, "AI服务暂时不可用，请稍后重试");
+
+        return switch (e.getCause()) {
+            case SocketTimeoutException _ ->
+                Result.error(ErrorCode.AI_SERVICE_TIMEOUT, "AI服务响应超时，请稍后重试");
+            case null, default -> {
+                String message = e.getMessage();
+                if (message != null && message.contains("handshake")) {
+                    yield Result.error(ErrorCode.AI_SERVICE_UNAVAILABLE, "AI服务连接失败（网络不稳定），请检查网络或稍后重试");
+                }
+                yield Result.error(ErrorCode.AI_SERVICE_UNAVAILABLE, "AI服务暂时不可用，请稍后重试");
+            }
+        };
     }
     
     /**
@@ -113,20 +111,37 @@ public class GlobalExceptionHandler {
     @ResponseStatus(HttpStatus.OK)
     public Result<Void> handleRestClientException(RestClientException e) {
         log.error("AI服务调用失败: {}", e.getMessage(), e);
-        
-        String message = e.getMessage();
-        if (message != null) {
-            if (message.contains("401") || message.contains("Unauthorized")) {
-                return Result.error(ErrorCode.AI_API_KEY_INVALID, "AI服务密钥无效，请联系管理员");
-            }
-            if (message.contains("429") || message.contains("Too Many Requests")) {
-                return Result.error(ErrorCode.AI_RATE_LIMIT_EXCEEDED, "AI服务调用过于频繁，请稍后重试");
-            }
-        }
-        
-        return Result.error(ErrorCode.AI_SERVICE_ERROR, "AI服务调用失败，请稍后重试");
+
+        return switch (e.getMessage()) {
+            case null -> Result.error(ErrorCode.AI_SERVICE_ERROR, "AI服务调用失败，请稍后重试");
+            case String m when m.contains("401") || m.contains("Unauthorized") ->
+                Result.error(ErrorCode.AI_API_KEY_INVALID, "AI服务密钥无效，请联系管理员");
+            case String m when m.contains("429") || m.contains("Too Many Requests") ->
+                Result.error(ErrorCode.AI_RATE_LIMIT_EXCEEDED, "AI服务调用过于频繁，请稍后重试");
+            default -> Result.error(ErrorCode.AI_SERVICE_ERROR, "AI服务调用失败，请稍后重试");
+        };
     }
     
+    /**
+     * 处理 404 - 资源未找到异常
+     */
+    @ExceptionHandler(org.springframework.web.servlet.resource.NoResourceFoundException.class)
+    @ResponseStatus(HttpStatus.OK)
+    public Result<Void> handleNoResourceFoundException(org.springframework.web.servlet.resource.NoResourceFoundException e) {
+        log.warn("资源未找到: {}", e.getResourcePath());
+        return Result.error(ErrorCode.NOT_FOUND, "API 接口不存在");
+    }
+
+    /**
+     * 处理请求方法不支持异常
+     */
+    @ExceptionHandler(org.springframework.web.HttpRequestMethodNotSupportedException.class)
+    @ResponseStatus(HttpStatus.OK)
+    public Result<Void> handleHttpRequestMethodNotSupportedException(org.springframework.web.HttpRequestMethodNotSupportedException e) {
+        log.warn("请求方法不支持: {} {}", e.getMethod(), e.getSupportedHttpMethods());
+        return Result.error(ErrorCode.METHOD_NOT_ALLOWED, "请求方法不支持: " + e.getMethod());
+    }
+
     /**
      * 处理其他未知异常
      * 统一返回 HTTP 200，通过业务错误码区分异常类型

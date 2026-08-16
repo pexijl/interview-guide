@@ -1,23 +1,37 @@
 package interview.guide.modules.interview.service;
 
+import interview.guide.common.constant.CommonConstants.InterviewDefaults;
+import interview.guide.common.ai.LlmProviderRegistry;
 import interview.guide.common.exception.BusinessException;
 import interview.guide.common.exception.ErrorCode;
 import interview.guide.common.model.AsyncTaskStatus;
 import interview.guide.infrastructure.redis.InterviewSessionCache;
 import interview.guide.infrastructure.redis.InterviewSessionCache.CachedSession;
+import interview.guide.infrastructure.redis.RedisService;
 import interview.guide.modules.interview.listener.EvaluateStreamProducer;
-import interview.guide.modules.interview.model.*;
+import interview.guide.modules.interview.model.CreateInterviewRequest;
+import interview.guide.modules.interview.model.HistoricalQuestion;
+import interview.guide.modules.interview.model.InterviewAnswerEntity;
+import interview.guide.modules.interview.model.InterviewQuestionDTO;
+import interview.guide.modules.interview.model.InterviewReportDTO;
+import interview.guide.modules.interview.model.InterviewSessionDTO;
+import interview.guide.modules.interview.model.InterviewSessionEntity;
+import interview.guide.modules.interview.model.SubmitAnswerRequest;
+import interview.guide.modules.interview.model.SubmitAnswerResponse;
 import interview.guide.modules.interview.model.InterviewSessionDTO.SessionStatus;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.stereotype.Service;
 import tools.jackson.core.type.TypeReference;
 import tools.jackson.databind.ObjectMapper;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 面试会话管理服务
@@ -28,12 +42,18 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class InterviewSessionService {
 
+    private static final String CREATE_LOCK_PREFIX = "interview:create:";
+    private static final String CREATE_RESULT_PREFIX = "interview:create:result:";
+    private static final Duration CREATE_RESULT_TTL = Duration.ofDays(1);
+
     private final InterviewQuestionService questionService;
     private final AnswerEvaluationService evaluationService;
     private final InterviewPersistenceService persistenceService;
     private final InterviewSessionCache sessionCache;
     private final ObjectMapper objectMapper;
     private final EvaluateStreamProducer evaluateStreamProducer;
+    private final LlmProviderRegistry llmProviderRegistry;
+    private final RedisService redisService;
 
     /**
      * 创建新的面试会话
@@ -41,6 +61,47 @@ public class InterviewSessionService {
      * 前端应该先调用 findUnfinishedSession 检查，或者使用 forceCreate 参数强制创建
      */
     public InterviewSessionDTO createSession(CreateInterviewRequest request) {
+        String requestId = normalizeRequestId(request.requestId());
+        if (requestId == null) {
+            return createSessionInternal(request);
+        }
+
+        return redisService.executeWithLock(
+            CREATE_LOCK_PREFIX + requestId,
+            185,
+            600,
+            TimeUnit.SECONDS,
+            () -> createIdempotentSession(request, requestId)
+        );
+    }
+
+    private InterviewSessionDTO createIdempotentSession(CreateInterviewRequest request, String requestId) {
+        String resultKey = CREATE_RESULT_PREFIX + requestId;
+        String cachedSessionId = redisService.get(resultKey);
+        if (cachedSessionId != null) {
+            log.info("复用缓存中的幂等创建请求: requestId={}, sessionId={}", requestId, cachedSessionId);
+            return getSession(cachedSessionId);
+        }
+
+        Optional<InterviewSessionEntity> existing = persistenceService.findByRequestId(requestId);
+        if (existing.isPresent()) {
+            String existingSessionId = existing.get().getSessionId();
+            log.info("从数据库恢复幂等创建请求: requestId={}, sessionId={}",
+                requestId, existingSessionId);
+            redisService.set(resultKey, existingSessionId, CREATE_RESULT_TTL);
+            return getSession(existingSessionId);
+        }
+
+        InterviewSessionDTO created = createSessionInternal(request, requestId);
+        redisService.set(resultKey, created.sessionId(), CREATE_RESULT_TTL);
+        return created;
+    }
+
+    private InterviewSessionDTO createSessionInternal(CreateInterviewRequest request) {
+        return createSessionInternal(request, null);
+    }
+
+    private InterviewSessionDTO createSessionInternal(CreateInterviewRequest request, String requestId) {
         // 如果指定了resumeId且未强制创建，检查是否有未完成的会话
         if (request.resumeId() != null && !Boolean.TRUE.equals(request.forceCreate())) {
             Optional<InterviewSessionDTO> unfinishedOpt = findUnfinishedSession(request.resumeId());
@@ -52,51 +113,121 @@ public class InterviewSessionService {
         }
 
         String sessionId = UUID.randomUUID().toString().replace("-", "").substring(0, 16);
+        String skillId = request.skillId() != null ? request.skillId() : InterviewDefaults.SKILL_ID;
+        String difficulty = request.difficulty() != null ? request.difficulty() : InterviewDefaults.DIFFICULTY;
 
-        log.info("创建新面试会话: {}, 题目数量: {}, resumeId: {}",
-            sessionId, request.questionCount(), request.resumeId());
+        log.info("创建新面试会话: {}, skill: {}, difficulty: {}, questionCount: {}, resumeId: {}",
+            sessionId, skillId, difficulty, request.questionCount(), request.resumeId());
 
-        // 获取历史问题
-        List<String> historicalQuestions = null;
-        if (request.resumeId() != null) {
-            historicalQuestions = persistenceService.getHistoricalQuestionsByResumeId(request.resumeId());
-        }
+        // 获取历史问题（通用模式按 skillId 查询，有简历时按 resumeId + skillId 精确匹配）
+        List<HistoricalQuestion> historicalQuestions =
+            persistenceService.getHistoricalQuestions(skillId, request.resumeId());
 
-        // 生成面试问题
-        List<InterviewQuestionDTO> questions = questionService.generateQuestions(
+        // 基于 Skill 生成面试问题
+        List<InterviewQuestionDTO> questions = questionService.generateQuestionsBySkill(
+            request.llmProvider(),
+            skillId,
+            difficulty,
             request.resumeText(),
             request.questionCount(),
-            historicalQuestions
+            historicalQuestions,
+            request.customCategories(),
+            request.jdText()
         );
 
-        // 保存到 Redis 缓存
-        sessionCache.saveSession(
-            sessionId,
-            request.resumeText(),
-            request.resumeId(),
-            questions,
-            0,
-            SessionStatus.CREATED
-        );
-
-        // 保存到数据库
-        if (request.resumeId() != null) {
+        if (requestId != null) {
+            try {
+                persistenceService.saveIdempotentSession(
+                    sessionId,
+                    request.resumeId(),
+                    questions.size(),
+                    questions,
+                    request.llmProvider(),
+                    skillId,
+                    difficulty,
+                    requestId
+                );
+            } catch (Exception e) {
+                Optional<InterviewSessionEntity> concurrentlyCreated =
+                    persistenceService.findByRequestId(requestId);
+                if (concurrentlyCreated.isPresent()) {
+                    return getSession(concurrentlyCreated.get().getSessionId());
+                }
+                log.error("持久化幂等面试会话失败: requestId={}", requestId, e);
+                throw new BusinessException(ErrorCode.INTERNAL_ERROR, "创建面试会话失败，请重试");
+            }
+        } else {
             try {
                 persistenceService.saveSession(sessionId, request.resumeId(),
-                    questions.size(), questions);
+                    questions.size(), questions, request.llmProvider(), skillId, difficulty);
             } catch (Exception e) {
                 log.warn("保存面试会话到数据库失败: {}", e.getMessage());
             }
         }
 
+        // 幂等请求必须先成功落库，再写入易失缓存，保证进程异常后可从数据库恢复。
+        sessionCache.saveSession(
+            sessionId,
+            request.resumeText() != null ? request.resumeText() : "",
+            request.resumeId(),
+            null,
+            null,
+            questions,
+            0,
+            SessionStatus.CREATED
+        );
+
         return new InterviewSessionDTO(
             sessionId,
-            request.resumeText(),
+            request.resumeText() != null ? request.resumeText() : "",
             questions.size(),
             0,
             questions,
-            SessionStatus.CREATED
+            SessionStatus.CREATED,
+            null,
+            null
         );
+    }
+
+    public InterviewSessionDTO createSessionFromQuestions(List<InterviewQuestionDTO> questions,
+                                                          String llmProvider,
+                                                          String skillId,
+                                                          String difficulty,
+                                                          Long knowledgeBaseId,
+                                                          String interviewCategory) {
+        if (questions == null || questions.isEmpty()) {
+            throw new BusinessException(ErrorCode.INTERVIEW_QUESTION_NOT_FOUND, "面试题目不能为空");
+        }
+
+        String sessionId = UUID.randomUUID().toString().replace("-", "").substring(0, 16);
+        persistenceService.saveSession(
+            sessionId, null, questions.size(), questions, llmProvider, skillId, difficulty,
+            "KNOWLEDGE_BASE", knowledgeBaseId, interviewCategory);
+        sessionCache.saveSession(sessionId, "", null, knowledgeBaseId, interviewCategory,
+            questions, 0, SessionStatus.CREATED);
+
+        return new InterviewSessionDTO(
+            sessionId,
+            "",
+            questions.size(),
+            0,
+            questions,
+            SessionStatus.CREATED,
+            knowledgeBaseId,
+            interviewCategory
+        );
+    }
+
+    private String normalizeRequestId(String requestId) {
+        if (requestId == null || requestId.isBlank()) {
+            return null;
+        }
+
+        String normalized = requestId.trim();
+        if (!normalized.matches("[A-Za-z0-9_-]{8,64}")) {
+            throw new BusinessException(ErrorCode.BAD_REQUEST, "requestId 格式不正确");
+        }
+        return normalized;
     }
 
     /**
@@ -198,8 +329,10 @@ public class InterviewSessionService {
             // 保存到 Redis 缓存
             sessionCache.saveSession(
                 entity.getSessionId(),
-                entity.getResume().getResumeText(),
-                entity.getResume().getId(),
+                entity.getResume() != null ? entity.getResume().getResumeText() : "",
+                entity.getResume() != null ? entity.getResume().getId() : null,
+                entity.getKnowledgeBaseId(),
+                entity.getInterviewCategory(),
                 questions,
                 entity.getCurrentQuestionIndex(),
                 status
@@ -297,34 +430,14 @@ public class InterviewSessionService {
 
         SessionStatus newStatus = hasNextQuestion ? SessionStatus.IN_PROGRESS : SessionStatus.COMPLETED;
 
-        // 更新 Redis 缓存
+        persistSubmittedAnswer(request, index, question, newIndex, newStatus);
+
+        // 更新 Redis 缓存。DB 已经持久化成功，缓存失败时可由后续读取从数据库恢复。
         sessionCache.updateQuestions(request.sessionId(), questions);
         sessionCache.updateCurrentIndex(request.sessionId(), newIndex);
         if (newStatus == SessionStatus.COMPLETED) {
             sessionCache.updateSessionStatus(request.sessionId(), SessionStatus.COMPLETED);
-        }
-
-        // 保存答案到数据库
-        try {
-            persistenceService.saveAnswer(
-                request.sessionId(), index,
-                question.question(), question.category(),
-                request.answer(), 0, null  // 分数在报告生成时更新
-            );
-            persistenceService.updateCurrentQuestionIndex(request.sessionId(), newIndex);
-            persistenceService.updateSessionStatus(request.sessionId(),
-                newStatus == SessionStatus.COMPLETED
-                    ? InterviewSessionEntity.SessionStatus.COMPLETED
-                    : InterviewSessionEntity.SessionStatus.IN_PROGRESS);
-
-            // 如果是最后一题，设置评估状态为 PENDING 并触发异步评估
-            if (!hasNextQuestion) {
-                persistenceService.updateEvaluateStatus(request.sessionId(), AsyncTaskStatus.PENDING, null);
-                evaluateStreamProducer.sendEvaluateTask(request.sessionId());
-                log.info("会话 {} 已完成所有问题，评估任务已入队", request.sessionId());
-            }
-        } catch (Exception e) {
-            log.warn("保存答案到数据库失败: {}", e.getMessage());
+            enqueueEvaluationTask(request.sessionId());
         }
 
         log.info("会话 {} 提交答案: 问题{}, 剩余{}题",
@@ -336,6 +449,36 @@ public class InterviewSessionService {
             newIndex,
             questions.size()
         );
+    }
+
+    private void persistSubmittedAnswer(SubmitAnswerRequest request, int index,
+                                        InterviewQuestionDTO question, int newIndex,
+                                        SessionStatus newStatus) {
+        try {
+            persistenceService.saveAnswer(
+                request.sessionId(), index,
+                question.question(), question.category(),
+                request.answer(), 0, null  // 分数在报告生成时更新
+            );
+            persistenceService.updateCurrentQuestionIndex(request.sessionId(), newIndex);
+            persistenceService.updateSessionStatus(request.sessionId(),
+                newStatus == SessionStatus.COMPLETED
+                    ? InterviewSessionEntity.SessionStatus.COMPLETED
+                    : InterviewSessionEntity.SessionStatus.IN_PROGRESS);
+        } catch (BusinessException e) {
+            throw e;
+        } catch (Exception e) {
+            log.error("保存答案到数据库失败: sessionId={}, questionIndex={}",
+                request.sessionId(), index, e);
+            throw new BusinessException(ErrorCode.INTERVIEW_ANSWER_SAVE_FAILED,
+                "保存答案失败，请稍后重试");
+        }
+    }
+
+    private void enqueueEvaluationTask(String sessionId) {
+        persistenceService.updateEvaluateStatus(sessionId, AsyncTaskStatus.PENDING, null);
+        evaluateStreamProducer.sendEvaluateTask(sessionId);
+        log.info("会话 {} 已完成所有问题，评估任务已入队", sessionId);
     }
 
     /**
@@ -443,7 +586,16 @@ public class InterviewSessionService {
 
         List<InterviewQuestionDTO> questions = session.getQuestions(objectMapper);
 
+        // 获取 LLM 客户端
+        String provider = null;
+        Optional<InterviewSessionEntity> entityOpt = persistenceService.findBySessionId(sessionId);
+        if (entityOpt.isPresent()) {
+            provider = entityOpt.get().getLlmProvider();
+        }
+        ChatClient chatClient = llmProviderRegistry.getChatClientOrDefault(provider);
+
         InterviewReportDTO report = evaluationService.evaluateInterview(
+            chatClient,
             sessionId,
             session.getResumeText(),
             questions
@@ -473,7 +625,9 @@ public class InterviewSessionService {
             questions.size(),
             session.getCurrentIndex(),
             questions,
-            session.getStatus()
+            session.getStatus(),
+            session.getKnowledgeBaseId(),
+            session.getInterviewCategory()
         );
     }
 }

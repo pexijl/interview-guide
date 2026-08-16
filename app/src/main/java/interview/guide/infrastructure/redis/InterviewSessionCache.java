@@ -1,5 +1,7 @@
 package interview.guide.infrastructure.redis;
 
+import interview.guide.common.exception.BusinessException;
+import interview.guide.common.exception.ErrorCode;
 import interview.guide.modules.interview.model.InterviewQuestionDTO;
 import interview.guide.modules.interview.model.InterviewSessionDTO.SessionStatus;
 import lombok.Data;
@@ -50,6 +52,8 @@ public class InterviewSessionCache {
         private String sessionId;
         private String resumeText;
         private Long resumeId;
+        private Long knowledgeBaseId;
+        private String interviewCategory;
         private String questionsJson;  // 序列化的问题列表
         private int currentIndex;
         private SessionStatus status;
@@ -57,18 +61,21 @@ public class InterviewSessionCache {
         public CachedSession() {
         }
 
-        public CachedSession(String sessionId, String resumeText, Long resumeId,
+        public CachedSession(String sessionId, String resumeText, Long resumeId, Long knowledgeBaseId,
+                            String interviewCategory,
                             List<InterviewQuestionDTO> questions, int currentIndex,
                             SessionStatus status, ObjectMapper objectMapper) {
             this.sessionId = sessionId;
             this.resumeText = resumeText;
             this.resumeId = resumeId;
+            this.knowledgeBaseId = knowledgeBaseId;
+            this.interviewCategory = interviewCategory;
             this.currentIndex = currentIndex;
             this.status = status;
             try {
                 this.questionsJson = objectMapper.writeValueAsString(questions);
             } catch (JacksonException e) {
-                throw new RuntimeException("序列化问题列表失败", e);
+                throw new BusinessException(ErrorCode.INTERNAL_ERROR, "序列化问题列表失败", e);
             }
         }
 
@@ -76,7 +83,7 @@ public class InterviewSessionCache {
             try {
                 return objectMapper.readValue(questionsJson, new TypeReference<>() {});
             } catch (JacksonException e) {
-                throw new RuntimeException("反序列化问题列表失败", e);
+                throw new BusinessException(ErrorCode.INTERNAL_ERROR, "反序列化问题列表失败");
             }
         }
     }
@@ -84,12 +91,14 @@ public class InterviewSessionCache {
     /**
      * 保存会话到缓存
      */
-    public void saveSession(String sessionId, String resumeText, Long resumeId,
+    public void saveSession(String sessionId, String resumeText, Long resumeId, Long knowledgeBaseId,
+                           String interviewCategory,
                            List<InterviewQuestionDTO> questions, int currentIndex,
                            SessionStatus status) {
         String key = buildSessionKey(sessionId);
         CachedSession cachedSession = new CachedSession(
-            sessionId, resumeText, resumeId, questions, currentIndex, status, objectMapper
+            sessionId, resumeText, resumeId, knowledgeBaseId, interviewCategory,
+            questions, currentIndex, status, objectMapper
         );
 
         redisService.set(key, cachedSession, SESSION_TTL);
@@ -99,7 +108,8 @@ public class InterviewSessionCache {
             saveResumeSessionMapping(resumeId, sessionId);
         }
 
-        log.debug("会话已缓存: sessionId={}, resumeId={}, status={}", sessionId, resumeId, status);
+        log.debug("会话已缓存: sessionId={}, resumeId={}, kbId={}, status={}",
+            sessionId, resumeId, knowledgeBaseId, status);
     }
 
     /**

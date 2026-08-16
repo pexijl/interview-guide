@@ -1,9 +1,19 @@
 package interview.guide.infrastructure.redis;
 
+import interview.guide.common.exception.BusinessException;
+import interview.guide.common.exception.ErrorCode;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.redisson.api.*;
+import org.redisson.api.RAtomicLong;
+import org.redisson.api.RBucket;
+import org.redisson.api.RKeys;
+import org.redisson.api.RList;
+import org.redisson.api.RLock;
+import org.redisson.api.RMap;
+import org.redisson.api.RStream;
+import org.redisson.api.RedissonClient;
 import org.redisson.api.options.KeysScanOptions;
+import org.redisson.api.stream.AutoClaimResult;
 import org.redisson.api.stream.StreamAddArgs;
 import org.redisson.api.stream.StreamCreateGroupArgs;
 import org.redisson.api.stream.StreamMessageId;
@@ -14,12 +24,23 @@ import org.springframework.stereotype.Service;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 
 /**
  * Redis 服务封装
  * 提供通用的 Redis 操作，包括缓存、分布式锁、Stream 消息队列等
+ *
+ * <p><b>Redisson 版本兼容说明：</b>
+ * <ul>
+ *   <li>当前适配 Redisson 4.0.0。</li>
+ *   <li>{@code stream.readGroup} / {@code stream.autoClaim} 在空结果时可能抛出
+ *       {@link ClassCastException}（Redisson 内部返回 EmptyList 而非空 Map），
+ *       两处均已 catch 并做空结果处理。</li>
+ *   <li>升级 Redisson 后如不再抛此异常，可清理对应的 catch 块。</li>
+ * </ul>
  */
 @Slf4j
 @Service
@@ -27,6 +48,7 @@ import java.util.function.Function;
 public class RedisService {
 
     private final RedissonClient redissonClient;
+    private final ConcurrentMap<String, StreamMessageId> streamReclaimCursors = new ConcurrentHashMap<>();
 
     // ==================== 基础键值操作 ====================
 
@@ -185,10 +207,10 @@ public class RedisService {
                     lock.unlock();
                 }
             }
-            throw new RuntimeException("获取锁失败: " + lockKey);
+            throw new BusinessException(ErrorCode.INTERNAL_ERROR, "获取锁失败: " + lockKey);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new RuntimeException("获取锁被中断: " + lockKey, e);
+            throw new BusinessException(ErrorCode.INTERNAL_ERROR, "获取锁被中断: " + lockKey, e);
         }
     }
 
@@ -226,22 +248,166 @@ public class RedisService {
             int count,
             long blockTimeoutMs,
             StreamMessageProcessor processor) {
-
-        RStream<String, String> stream = redissonClient.getStream(streamKey, StringCodec.INSTANCE);
-
-        // 使用阻塞读取，让 Redis 服务端等待消息
-        Map<StreamMessageId, Map<String, String>> messages = stream.readGroup(
+        return streamConsumeMessages(
+            streamKey,
             groupName,
             consumerName,
-            StreamReadGroupArgs.neverDelivered()
-                .count(count)
-                .timeout(Duration.ofMillis(blockTimeoutMs))
+            count,
+            blockTimeoutMs,
+            0L,
+            processor
         );
+    }
+
+    /**
+     * 消费 Stream 消息（优先回收超时 Pending，再阻塞读取新消息）
+     *
+     * @param streamKey            Stream 键
+     * @param groupName            消费者组名
+     * @param consumerName         消费者名
+     * @param count                每次读取数量
+     * @param blockTimeoutMs       阻塞等待超时时间（毫秒），0 表示无限等待
+     * @param pendingIdleTimeoutMs Pending 消息超过该 idle 时间后可被当前消费者回收
+     * @param processor            消息处理器
+     * @return true 如果处理了消息，false 如果超时无消息
+     */
+    public boolean streamConsumeMessages(
+            String streamKey,
+            String groupName,
+            String consumerName,
+            int count,
+            long blockTimeoutMs,
+            long pendingIdleTimeoutMs,
+            StreamMessageProcessor processor) {
+        return streamConsumeMessages(
+            streamKey,
+            groupName,
+            consumerName,
+            count,
+            blockTimeoutMs,
+            pendingIdleTimeoutMs,
+            count,
+            processor
+        );
+    }
+
+    /**
+     * 消费 Stream 消息（优先回收超时 Pending，再阻塞读取新消息）
+     *
+     * @param streamKey              Stream 键
+     * @param groupName              消费者组名
+     * @param consumerName           消费者名
+     * @param count                  每次读取新消息数量
+     * @param blockTimeoutMs         阻塞等待超时时间（毫秒），0 表示无限等待
+     * @param pendingIdleTimeoutMs   Pending 消息超过该 idle 时间后可被当前消费者回收
+     * @param pendingClaimBatchSize  每轮最多回收的 Pending 消息数
+     * @param processor              消息处理器
+     * @return true 如果处理了消息，false 如果超时无消息
+     */
+    public boolean streamConsumeMessages(
+            String streamKey,
+            String groupName,
+            String consumerName,
+            int count,
+            long blockTimeoutMs,
+            long pendingIdleTimeoutMs,
+            int pendingClaimBatchSize,
+            StreamMessageProcessor processor) {
+
+        RStream<String, String> stream = redissonClient.getStream(streamKey, StringCodec.INSTANCE);
+        Map<StreamMessageId, Map<String, String>> messages = reclaimPendingMessages(
+            stream,
+            streamKey,
+            groupName,
+            consumerName,
+            pendingClaimBatchSize,
+            pendingIdleTimeoutMs
+        );
+        if (processMessages(messages, processor)) {
+            return true;
+        }
+
+        // 使用阻塞读取，让 Redis 服务端等待消息
+        try {
+            messages = stream.readGroup(
+                groupName,
+                consumerName,
+                StreamReadGroupArgs.neverDelivered()
+                    .count(count)
+                    .timeout(Duration.ofMillis(blockTimeoutMs))
+            );
+        } catch (ClassCastException e) {
+            // Redisson 4.0.0 bug: 无消息时返回 EmptyList 而非空 Map，内部强转失败。
+            // 等价于"本次无消息"，静默返回即可。
+            log.debug("Redisson 4.0.0 内部类型转换异常（空结果时触发），等价于本批无消息: stream={}, group={}",
+                streamKey, groupName);
+            return false;
+        }
 
         if (messages == null || messages.isEmpty()) {
             return false;
         }
 
+        return processMessages(messages, processor);
+    }
+
+    private Map<StreamMessageId, Map<String, String>> reclaimPendingMessages(
+            RStream<String, String> stream,
+            String streamKey,
+            String groupName,
+            String consumerName,
+            int count,
+            long pendingIdleTimeoutMs) {
+        if (pendingIdleTimeoutMs <= 0 || count <= 0) {
+            return Map.of();
+        }
+
+        String cursorKey = streamKey + ":" + groupName;
+        StreamMessageId startId = streamReclaimCursors.getOrDefault(cursorKey, StreamMessageId.MIN);
+        AutoClaimResult<String, String> result;
+        try {
+            result = stream.autoClaim(
+                groupName,
+                consumerName,
+                pendingIdleTimeoutMs,
+                TimeUnit.MILLISECONDS,
+                startId,
+                count
+            );
+        } catch (ClassCastException e) {
+            // Redisson 4.0.0 空结果可能触发内部类型转换异常，等价于本轮无可回收消息。
+            log.debug("Redisson 4.0.0 内部类型转换异常（无可回收消息）: stream={}, group={}",
+                streamKey, groupName);
+            return Map.of();
+        }
+
+        StreamMessageId nextId = result.getNextId();
+        if (nextId == null || StreamMessageId.MIN.equals(nextId)) {
+            streamReclaimCursors.remove(cursorKey);
+        } else {
+            streamReclaimCursors.put(cursorKey, nextId);
+        }
+
+        List<StreamMessageId> deletedIds = result.getDeletedIds();
+        if (deletedIds != null && !deletedIds.isEmpty()) {
+            log.warn("Stream pending messages were trimmed before reclaim: stream={}, group={}, ids={}",
+                streamKey, groupName, deletedIds);
+        }
+
+        Map<StreamMessageId, Map<String, String>> messages = result.getMessages();
+        if (messages != null && !messages.isEmpty()) {
+            log.info("Reclaimed Redis Stream pending messages: stream={}, group={}, consumer={}, count={}",
+                streamKey, groupName, consumerName, messages.size());
+        }
+        return messages == null ? Map.of() : messages;
+    }
+
+    private boolean processMessages(
+            Map<StreamMessageId, Map<String, String>> messages,
+            StreamMessageProcessor processor) {
+        if (messages == null || messages.isEmpty()) {
+            return false;
+        }
         for (Map.Entry<StreamMessageId, Map<String, String>> entry : messages.entrySet()) {
             processor.process(entry.getKey(), entry.getValue());
         }
@@ -259,9 +425,12 @@ public class RedisService {
             log.info("创建 Stream 消费者组: stream={}, group={}", streamKey, groupName);
         } catch (Exception e) {
             // 组已存在，忽略
-            if (!e.getMessage().contains("BUSYGROUP")) {
-                log.warn("创建消费者组失败: {}", e.getMessage());
+            if (e instanceof org.redisson.client.RedisException
+                    && e.getMessage() != null
+                    && e.getMessage().contains("BUSYGROUP")) {
+                return;
             }
+            log.warn("创建消费者组失败: stream={}, group={}, error={}", streamKey, groupName, e.getMessage());
         }
     }
 

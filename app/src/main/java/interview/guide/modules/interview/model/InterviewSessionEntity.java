@@ -14,7 +14,8 @@ import java.util.List;
 @Entity
 @Table(name = "interview_sessions", indexes = {
     @Index(name = "idx_interview_session_resume_created", columnList = "resume_id,created_at"),
-    @Index(name = "idx_interview_session_resume_status_created", columnList = "resume_id,status,created_at")
+    @Index(name = "idx_interview_session_resume_status_created", columnList = "resume_id,status,created_at"),
+    @Index(name = "idx_interview_session_skill_created", columnList = "skillId,createdAt")
 })
 public class InterviewSessionEntity {
     
@@ -25,10 +26,26 @@ public class InterviewSessionEntity {
     // 会话ID (UUID)
     @Column(nullable = false, unique = true, length = 36)
     private String sessionId;
+
+    // 创建请求幂等键（仅文本面试创建链路使用）
+    @Column(name = "request_id", unique = true, length = 64)
+    private String requestId;
     
-    // 关联的简历
+    // 面试主题
+    @Column(length = 64)
+    private String skillId = "java-backend";
+
+    // 难度级别 (junior / mid / senior)
+    @Column(length = 16)
+    private String difficulty = "mid";
+
+    // 简历ID（直接映射FK列，避免LAZY加载触发额外查询）
+    @Column(name = "resume_id", insertable = false, updatable = false)
+    private Long resumeId;
+
+    // 关联的简历（可选，支持无简历通用面试）
     @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "resume_id", nullable = false)
+    @JoinColumn(name = "resume_id")
     private ResumeEntity resume;
     
     // 问题总数
@@ -84,6 +101,21 @@ public class InterviewSessionEntity {
     // 评估错误信息
     @Column(length = 500)
     private String evaluateError;
+
+    // LLM提供商
+    @Column(length = 50)
+    private String llmProvider = "dashscope";
+
+    // 会话来源：NORMAL / KNOWLEDGE_BASE
+    @Column(length = 32)
+    private String sourceType = "NORMAL";
+
+    // 知识库面试来源知识库 ID
+    private Long knowledgeBaseId;
+
+    // 知识库面试方向（来自题库 category，普通面试为 null）
+    @Column(length = 64)
+    private String interviewCategory;
     
     public enum SessionStatus {
         CREATED,      // 会话已创建
@@ -113,11 +145,23 @@ public class InterviewSessionEntity {
     public void setSessionId(String sessionId) {
         this.sessionId = sessionId;
     }
+
+    public String getRequestId() {
+        return requestId;
+    }
+
+    public void setRequestId(String requestId) {
+        this.requestId = requestId;
+    }
     
+    public Long getResumeId() {
+        return resumeId;
+    }
+
     public ResumeEntity getResume() {
         return resume;
     }
-    
+
     public void setResume(ResumeEntity resume) {
         this.resume = resume;
     }
@@ -232,6 +276,54 @@ public class InterviewSessionEntity {
 
     public void setEvaluateError(String evaluateError) {
         this.evaluateError = evaluateError;
+    }
+
+    public String getLlmProvider() {
+        return llmProvider;
+    }
+
+    public void setLlmProvider(String llmProvider) {
+        this.llmProvider = llmProvider;
+    }
+
+    public String getSkillId() {
+        return skillId;
+    }
+
+    public void setSkillId(String skillId) {
+        this.skillId = skillId;
+    }
+
+    public String getDifficulty() {
+        return difficulty;
+    }
+
+    public void setDifficulty(String difficulty) {
+        this.difficulty = difficulty;
+    }
+
+    public String getSourceType() {
+        return sourceType;
+    }
+
+    public void setSourceType(String sourceType) {
+        this.sourceType = sourceType;
+    }
+
+    public Long getKnowledgeBaseId() {
+        return knowledgeBaseId;
+    }
+
+    public void setKnowledgeBaseId(Long knowledgeBaseId) {
+        this.knowledgeBaseId = knowledgeBaseId;
+    }
+
+    public String getInterviewCategory() {
+        return interviewCategory;
+    }
+
+    public void setInterviewCategory(String interviewCategory) {
+        this.interviewCategory = interviewCategory;
     }
 
     public void addAnswer(InterviewAnswerEntity answer) {

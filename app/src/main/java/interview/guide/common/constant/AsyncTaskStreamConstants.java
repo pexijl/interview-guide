@@ -35,6 +35,16 @@ public final class AsyncTaskStreamConstants {
     public static final int BATCH_SIZE = 10;
 
     /**
+     * Pending 消息空闲超过该时间后允许被当前消费者认领（毫秒）
+     */
+    public static final long PENDING_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+
+    /**
+     * 每轮最多回收的 pending 消息数
+     */
+    public static final int PENDING_CLAIM_BATCH_SIZE = 10;
+
+    /**
      * 消费者轮询间隔（毫秒）
      */
     public static final long POLL_INTERVAL_MS = 1000;
@@ -109,4 +119,73 @@ public final class AsyncTaskStreamConstants {
      * 面试会话ID字段
      */
     public static final String FIELD_SESSION_ID = "sessionId";
+
+    // ========== 语音面试评估 Stream 配置 ==========
+
+    /**
+     * 语音面试评估 Stream Key
+     */
+    public static final String VOICE_EVALUATE_STREAM_KEY = "voice:evaluate:stream";
+
+    /**
+     * 语音面试评估 Consumer Group 名称
+     */
+    public static final String VOICE_EVALUATE_GROUP_NAME = "voice-evaluate-group";
+
+    /**
+     * 语音面试评估 Consumer 名称前缀
+     */
+    public static final String VOICE_EVALUATE_CONSUMER_PREFIX = "voice-evaluate-consumer-";
+
+    /**
+     * 语音面试会话ID字段
+     */
+    public static final String FIELD_VOICE_SESSION_ID = "voiceSessionId";
+
+    // ========== 知识库问题生成 Stream 配置 ==========
+
+    /**
+     * 知识库问题生成 Stream Key
+     */
+    public static final String KB_QUESTION_GEN_STREAM_KEY = "knowledgebase:question-gen:stream";
+
+    /**
+     * 知识库问题生成 Consumer Group 名称
+     */
+    public static final String KB_QUESTION_GEN_GROUP_NAME = "question-gen-group";
+
+    /**
+     * 知识库问题生成 Consumer 名称前缀
+     */
+    public static final String KB_QUESTION_GEN_CONSUMER_PREFIX = "question-gen-consumer-";
+
+    /**
+     * 任务ID字段（用于幂等判断）
+     */
+    public static final String FIELD_TASK_ID = "taskId";
+
+    /**
+     * 难度字段
+     */
+    public static final String FIELD_DIFFICULTY = "difficulty";
+
+    /**
+     * 题目数量字段
+     */
+    public static final String FIELD_QUESTION_COUNT = "questionCount";
+
+    /**
+     * 追问数量字段
+     */
+    public static final String FIELD_FOLLOW_UP_COUNT = "followUpCount";
+
+    /**
+     * 方向数量字段
+     */
+    public static final String FIELD_CATEGORY_LIMIT = "categoryLimit";
+
+    /**
+     * LLM Provider字段
+     */
+    public static final String FIELD_LLM_PROVIDER = "llmProvider";
 }

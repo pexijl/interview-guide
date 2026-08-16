@@ -4,6 +4,7 @@ import interview.guide.common.config.AppConfigProperties;
 import interview.guide.common.exception.BusinessException;
 import interview.guide.common.exception.ErrorCode;
 import interview.guide.common.model.AsyncTaskStatus;
+import interview.guide.common.transaction.TransactionalExecutor;
 import interview.guide.infrastructure.file.FileStorageService;
 import interview.guide.infrastructure.file.FileValidationService;
 import interview.guide.modules.interview.model.ResumeAnalysisResponse;
@@ -13,7 +14,6 @@ import interview.guide.modules.resume.repository.ResumeRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
 import java.util.Map;
 import java.util.Optional;
@@ -35,6 +35,7 @@ public class ResumeUploadService {
     private final FileValidationService fileValidationService;
     private final AnalyzeStreamProducer analyzeStreamProducer;
     private final ResumeRepository resumeRepository;
+    private final TransactionalExecutor transactionalExecutor;
 
     private static final long MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 
@@ -45,11 +46,15 @@ public class ResumeUploadService {
      * @return 上传结果（分析将异步进行）
      */
     public Map<String, Object> uploadAndAnalyze(org.springframework.web.multipart.MultipartFile file) {
+        long startTime = System.currentTimeMillis();
+
         // 1. 验证文件
         fileValidationService.validateFile(file, MAX_FILE_SIZE, "简历");
 
         String fileName = file.getOriginalFilename();
-        log.info("收到简历上传请求: {}, 大小: {} bytes", fileName, file.getSize());
+        long fileSize = file.getSize();
+        log.info("收到简历上传请求: {}, 大小: {} bytes ({}), 上传开始处理",
+            fileName, fileSize, formatFileSize(fileSize));
 
         // 2. 验证文件类型
         String contentType = parseService.detectContentType(file);
@@ -58,19 +63,26 @@ public class ResumeUploadService {
         // 3. 检查简历是否已存在（去重）
         Optional<ResumeEntity> existingResume = persistenceService.findExistingResume(file);
         if (existingResume.isPresent()) {
+            log.info("简历上传处理完成（重复）: {} - 耗时: {}ms",
+                fileName, System.currentTimeMillis() - startTime);
             return handleDuplicateResume(existingResume.get());
         }
 
         // 4. 解析简历文本
+        long parseStart = System.currentTimeMillis();
         String resumeText = parseService.parseResume(file);
         if (resumeText == null || resumeText.trim().isEmpty()) {
             throw new BusinessException(ErrorCode.RESUME_PARSE_FAILED, "无法从文件中提取文本内容，请确保文件不是扫描版PDF");
         }
+        log.info("简历文本解析完成: {} - 解析耗时: {}ms, 文本长度: {} 字符",
+            fileName, System.currentTimeMillis() - parseStart, resumeText.length());
 
         // 5. 保存简历到RustFS
+        long storageStart = System.currentTimeMillis();
         String fileKey = storageService.uploadResume(file);
         String fileUrl = storageService.getFileUrl(fileKey);
-        log.info("简历已存储到RustFS: {}", fileKey);
+        log.info("简历已存储到RustFS: {} - 存储耗时: {}ms",
+            fileKey, System.currentTimeMillis() - storageStart);
 
         // 6. 保存简历到数据库（状态为 PENDING）
         ResumeEntity savedResume = persistenceService.saveResume(file, resumeText, fileKey, fileUrl);
@@ -78,7 +90,9 @@ public class ResumeUploadService {
         // 7. 发送分析任务到 Redis Stream（异步处理）
         analyzeStreamProducer.sendAnalyzeTask(savedResume.getId(), resumeText);
 
-        log.info("简历上传完成，分析任务已入队: {}, resumeId={}", fileName, savedResume.getId());
+        long totalTime = System.currentTimeMillis() - startTime;
+        log.info("简历上传处理完成: {}, resumeId={} - 总耗时: {}ms (解析+存储+入库)",
+            fileName, savedResume.getId(), totalTime);
 
         // 8. 返回结果（状态为 PENDING，前端可轮询获取最新状态）
         return Map.of(
@@ -94,6 +108,15 @@ public class ResumeUploadService {
             ),
             "duplicate", false
         );
+    }
+
+    /**
+     * 格式化文件大小为可读字符串
+     */
+    private String formatFileSize(long bytes) {
+        if (bytes < 1024) return bytes + "B";
+        if (bytes < 1024 * 1024) return String.format("%.1fKB", bytes / 1024.0);
+        return String.format("%.1fMB", bytes / (1024.0 * 1024.0));
     }
 
     /**
@@ -147,32 +170,66 @@ public class ResumeUploadService {
      *
      * @param resumeId 简历ID
      */
-    @Transactional
     public void reanalyze(Long resumeId) {
+        ResumeReanalyzeSource source = loadReanalyzeSource(resumeId);
+
+        log.info("开始重新分析简历: resumeId={}, filename={}", resumeId, source.originalFilename());
+
+        String resumeText = source.resumeText();
+        boolean shouldCacheResumeText = !hasText(resumeText);
+        if (shouldCacheResumeText) {
+            // 如果没有缓存的文本，尝试重新解析
+            resumeText = parseService.downloadAndParseContent(
+                source.storageKey(), source.originalFilename());
+            if (!hasText(resumeText)) {
+                throw new BusinessException(ErrorCode.RESUME_PARSE_FAILED, "无法获取简历文本内容");
+            }
+        }
+
+        String taskContent = resumeText;
+        transactionalExecutor.run(
+            () -> updateResumeForReanalysis(resumeId, taskContent, shouldCacheResumeText));
+
+        // 事务提交后再发送分析任务到 Stream
+        analyzeStreamProducer.sendAnalyzeTask(resumeId, taskContent);
+
+        log.info("重新分析任务已发送: resumeId={}", resumeId);
+    }
+
+    private ResumeReanalyzeSource loadReanalyzeSource(Long resumeId) {
+        ResumeEntity resume = resumeRepository.findById(resumeId)
+            .orElseThrow(() -> new BusinessException(ErrorCode.RESUME_NOT_FOUND, "简历不存在"));
+        return new ResumeReanalyzeSource(
+            resume.getOriginalFilename(),
+            resume.getStorageKey(),
+            resume.getResumeText()
+        );
+    }
+
+    private void updateResumeForReanalysis(
+        Long resumeId,
+        String resumeText,
+        boolean shouldCacheResumeText
+    ) {
         ResumeEntity resume = resumeRepository.findById(resumeId)
             .orElseThrow(() -> new BusinessException(ErrorCode.RESUME_NOT_FOUND, "简历不存在"));
 
-        log.info("开始重新分析简历: resumeId={}, filename={}", resumeId, resume.getOriginalFilename());
-
-        String resumeText = resume.getResumeText();
-        if (resumeText == null || resumeText.trim().isEmpty()) {
-            // 如果没有缓存的文本，尝试重新解析
-            resumeText = parseService.downloadAndParseContent(resume.getStorageKey(), resume.getOriginalFilename());
-            if (resumeText == null || resumeText.trim().isEmpty()) {
-                throw new BusinessException(ErrorCode.RESUME_PARSE_FAILED, "无法获取简历文本内容");
-            }
-            // 更新缓存的文本
+        if (shouldCacheResumeText || !hasText(resume.getResumeText())) {
             resume.setResumeText(resumeText);
         }
-
-        // 更新状态为 PENDING
         resume.setAnalyzeStatus(AsyncTaskStatus.PENDING);
         resume.setAnalyzeError(null);
         resumeRepository.save(resume);
+    }
 
-        // 发送分析任务到 Stream
-        analyzeStreamProducer.sendAnalyzeTask(resumeId, resumeText);
+    private boolean hasText(String value) {
+        return value != null && !value.trim().isEmpty();
+    }
 
-        log.info("重新分析任务已发送: resumeId={}", resumeId);
+    private record ResumeReanalyzeSource(
+        String originalFilename,
+        String storageKey,
+        String resumeText
+    ) {
     }
 }

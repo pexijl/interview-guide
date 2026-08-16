@@ -1,14 +1,15 @@
 package interview.guide.common.config;
 
+import java.net.URI;
+import java.time.Duration;
 import lombok.RequiredArgsConstructor;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.core.client.config.ClientOverrideConfiguration;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
-
-import java.net.URI;
 
 /**
  * S3客户端配置（用于RustFS）
@@ -44,6 +45,8 @@ public class S3Config {
                 .region(Region.of(storageConfig.getRegion()))
                 // 设置凭证提供者，使用刚才创建的静态凭证（AccessKey/SecretKey）
                 .credentialsProvider(StaticCredentialsProvider.create(credentials))
+                // 设置调用超时，避免存储端无响应时请求线程被长期占用
+                .overrideConfiguration(clientOverrideConfiguration())
                 // 关键配置：开启路径风格访问
                 // 设置为true：URL格式为 http://endpoint/bucket/object (路径风格)
                 // 如果不设置（默认false）：URL格式为 http://bucket.endpoint/object (虚拟主机风格)
@@ -51,5 +54,18 @@ public class S3Config {
                 .forcePathStyle(true)
                 // 构建最终的S3Client对象
                 .build();
+    }
+
+    private ClientOverrideConfiguration clientOverrideConfiguration() {
+        ClientOverrideConfiguration.Builder builder = ClientOverrideConfiguration.builder();
+        Duration apiCallTimeout = storageConfig.getApiCallTimeout();
+        Duration apiCallAttemptTimeout = storageConfig.getApiCallAttemptTimeout();
+        if (apiCallTimeout != null) {
+            builder.apiCallTimeout(apiCallTimeout);
+        }
+        if (apiCallAttemptTimeout != null) {
+            builder.apiCallAttemptTimeout(apiCallAttemptTimeout);
+        }
+        return builder.build();
     }
 }
